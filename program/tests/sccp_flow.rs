@@ -1456,6 +1456,9 @@ async fn solana_program_flow_burn_and_mint_with_incident_controls() {
     let burn_payload_bytes = burn_payload.encode_scale();
     let burn_message_id = burn_message_id(&burn_payload_bytes);
     let (burn_rec, _burn_rec_bump) = burn_record_pda(&program_id, &burn_message_id);
+    // Use a distinct PDA in the blocked burn probe so the post-unpause burn is not
+    // the same transaction message/signature as the earlier expected-failure attempt.
+    let blocked_burn_rec = burn_record_pda(&program_id, &[0xCCu8; 32]).0;
 
     // Outbound pause (to SORA) must block burns and must not increment the outbound nonce.
     {
@@ -1490,7 +1493,7 @@ async fn solana_program_flow_burn_and_mint_with_incident_controls() {
                 AccountMeta::new(token_cfg, false),
                 AccountMeta::new(alice_token.pubkey(), false),
                 AccountMeta::new(mint, false),
-                AccountMeta::new(burn_rec, false),
+                AccountMeta::new(blocked_burn_rec, false),
                 AccountMeta::new_readonly(system_program::id(), false),
                 AccountMeta::new_readonly(spl_token::id(), false),
             ],
