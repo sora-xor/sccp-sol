@@ -17,7 +17,10 @@ use tokio::sync::Mutex;
 use sccp_sol::{
     burn_message_id, BurnPayloadV1, SCCP_DOMAIN_ETH, SCCP_DOMAIN_SOL, SCCP_DOMAIN_SORA,
 };
-use sccp_sol_program::{process_instruction, BurnRecord, Config, SccpError, SccpInstruction};
+use sccp_sol_program::{
+    process_instruction, BurnRecord, Config, InboundMarker, InboundStatus, SccpError,
+    SccpInstruction,
+};
 use sccp_sol_verifier_program::{
     process_instruction as verifier_process_instruction, Commitment as VerifierCommitment,
     MmrLeaf as VerifierMmrLeaf, MmrProof as VerifierMmrProof, SoraBurnProofV1,
@@ -1622,6 +1625,480 @@ async fn solana_program_flow_burn_and_mint_with_incident_controls() {
         let cfg_after = banks_client.get_account(config).await.unwrap().unwrap();
         let cfg_after = Config::try_from_slice(&cfg_after.data).unwrap();
         assert_eq!(cfg_after.outbound_nonce, 1);
+    }
+
+    drop(test_lock);
+}
+
+#[tokio::test]
+async fn solana_program_rejects_non_governor_admin_calls() {
+    let test_lock = program_test_lock().await;
+    let program_id = Pubkey::new_unique();
+    let pt = ProgramTest::new(
+        "sccp_sol_program",
+        program_id,
+        processor!(process_instruction),
+    );
+    let (mut banks_client, payer, _recent_blockhash) = pt.start().await;
+
+    let attacker = Keypair::new();
+    let (config, _config_bump) = config_pda(&program_id);
+
+    // Initialize config with payer as governor.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::Initialize {
+                governor: payer.pubkey(),
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    // Fund attacker so the signer account exists in runtime account loading.
+    {
+        let ix = system_instruction::transfer(&payer.pubkey(), &attacker.pubkey(), 1_000_000);
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    // Non-governor cannot set verifier program.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(config, false),
+            ],
+            data: SccpInstruction::SetVerifierProgram {
+                verifier_program: Pubkey::new_unique(),
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::NotGovernor as u32);
+    }
+
+    // Non-governor cannot change governor either.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(attacker.pubkey(), true),
+                AccountMeta::new(config, false),
+            ],
+            data: SccpInstruction::SetGovernor {
+                governor: attacker.pubkey(),
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer, &attacker],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::NotGovernor as u32);
+    }
+
+    drop(test_lock);
+}
+
+#[tokio::test]
+async fn solana_program_clear_invalidated_marker_and_local_domain_admin_guards() {
+    let test_lock = program_test_lock().await;
+    let program_id = Pubkey::new_unique();
+    let pt = ProgramTest::new(
+        "sccp_sol_program",
+        program_id,
+        processor!(process_instruction),
+    );
+    let (mut banks_client, payer, _recent_blockhash) = pt.start().await;
+
+    let (config, _config_bump) = config_pda(&program_id);
+
+    // Initialize config with payer as governor.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::Initialize {
+                governor: payer.pubkey(),
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    let message_id = [0xabu8; 32];
+    let (marker, _marker_bump) = inbound_marker_pda(&program_id, SCCP_DOMAIN_SORA, &message_id);
+
+    // Mark inbound message as invalidated.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new(marker, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::InvalidateInboundMessage {
+                source_domain: SCCP_DOMAIN_SORA,
+                message_id,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+    {
+        let marker_acc = banks_client.get_account(marker).await.unwrap().unwrap();
+        let marker_data = InboundMarker::try_from_slice(&marker_acc.data).unwrap();
+        assert_eq!(marker_data.status, InboundStatus::Invalidated);
+    }
+
+    // Clear the invalidation marker.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new(marker, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::ClearInvalidatedInboundMessage {
+                source_domain: SCCP_DOMAIN_SORA,
+                message_id,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+    {
+        let marker_acc = banks_client.get_account(marker).await.unwrap().unwrap();
+        let marker_data = InboundMarker::try_from_slice(&marker_acc.data).unwrap();
+        assert_eq!(marker_data.status, InboundStatus::None);
+    }
+
+    // Local-domain controls must be rejected.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+            ],
+            data: SccpInstruction::SetInboundDomainPaused {
+                source_domain: SCCP_DOMAIN_SOL,
+                paused: true,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::DomainEqualsLocal as u32);
+    }
+
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+            ],
+            data: SccpInstruction::SetOutboundDomainPaused {
+                dest_domain: SCCP_DOMAIN_SOL,
+                paused: true,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::DomainEqualsLocal as u32);
+    }
+
+    let (local_marker, _local_marker_bump) =
+        inbound_marker_pda(&program_id, SCCP_DOMAIN_SOL, &message_id);
+
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new(local_marker, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::InvalidateInboundMessage {
+                source_domain: SCCP_DOMAIN_SOL,
+                message_id,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::DomainEqualsLocal as u32);
+    }
+
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new(local_marker, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::ClearInvalidatedInboundMessage {
+                source_domain: SCCP_DOMAIN_SOL,
+                message_id,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::DomainEqualsLocal as u32);
+    }
+
+    drop(test_lock);
+}
+
+#[tokio::test]
+async fn solana_program_mint_from_proof_rejects_local_domain_and_bad_lengths_early() {
+    let test_lock = program_test_lock().await;
+    let program_id = Pubkey::new_unique();
+    let pt = ProgramTest::new(
+        "sccp_sol_program",
+        program_id,
+        processor!(process_instruction),
+    );
+    let (mut banks_client, payer, _recent_blockhash) = pt.start().await;
+
+    // Local source domain must fail before account loading.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![],
+            data: SccpInstruction::MintFromProof {
+                source_domain: SCCP_DOMAIN_SOL,
+                payload: vec![],
+                proof: vec![],
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::DomainEqualsLocal as u32);
+    }
+
+    // Invalid payload length must fail before account loading.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![],
+            data: SccpInstruction::MintFromProof {
+                source_domain: SCCP_DOMAIN_SORA,
+                payload: vec![0u8; 7],
+                proof: vec![],
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        expect_custom(err.into(), SccpError::PayloadInvalidLength as u32);
+    }
+
+    // Oversized proof must fail before account loading.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![],
+            data: SccpInstruction::MintFromProof {
+                source_domain: SCCP_DOMAIN_SORA,
+                payload: vec![0u8; BurnPayloadV1::ENCODED_LEN],
+                proof: vec![0u8; 16 * 1024 + 1],
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        let err = banks_client.process_transaction(tx).await.unwrap_err();
+        let err: TransportError = err.into();
+        match err {
+            TransportError::TransactionError(TransactionError::InstructionError(
+                _,
+                InstructionError::InvalidInstructionData,
+            )) => {}
+            other => panic!("expected InvalidInstructionData, got: {other:?}"),
+        }
+    }
+
+    drop(test_lock);
+}
+
+#[tokio::test]
+async fn solana_program_clear_invalidated_is_noop_for_fresh_marker() {
+    let test_lock = program_test_lock().await;
+    let program_id = Pubkey::new_unique();
+    let pt = ProgramTest::new(
+        "sccp_sol_program",
+        program_id,
+        processor!(process_instruction),
+    );
+    let (mut banks_client, payer, _recent_blockhash) = pt.start().await;
+
+    let (config, _config_bump) = config_pda(&program_id);
+
+    // Initialize config with payer as governor.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::Initialize {
+                governor: payer.pubkey(),
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+
+    let message_id = [0x55u8; 32];
+    let (marker, _marker_bump) = inbound_marker_pda(&program_id, SCCP_DOMAIN_SORA, &message_id);
+
+    // Clearing without prior invalidation should still create marker account and keep status None.
+    {
+        let ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(config, false),
+                AccountMeta::new(marker, false),
+                AccountMeta::new_readonly(system_program::id(), false),
+            ],
+            data: SccpInstruction::ClearInvalidatedInboundMessage {
+                source_domain: SCCP_DOMAIN_SORA,
+                message_id,
+            }
+            .try_to_vec()
+            .unwrap(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            banks_client.get_latest_blockhash().await.unwrap(),
+        );
+        banks_client.process_transaction(tx).await.unwrap();
+    }
+    {
+        let marker_acc = banks_client.get_account(marker).await.unwrap().unwrap();
+        let marker_data = InboundMarker::try_from_slice(&marker_acc.data).unwrap();
+        assert_eq!(marker_data.status, InboundStatus::None);
     }
 
     drop(test_lock);

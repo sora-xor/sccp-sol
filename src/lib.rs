@@ -110,6 +110,7 @@ mod tests {
     use alloc::vec::Vec;
     use hex::FromHex;
     use parity_scale_codec::Encode;
+    use tiny_keccak::{Hasher, Keccak};
 
     #[derive(Encode)]
     struct RefPayload {
@@ -179,5 +180,119 @@ mod tests {
 
         let msg_id = burn_message_id(&payload);
         assert_eq!(msg_id.as_slice(), expected_message_id.as_slice());
+    }
+
+    #[test]
+    fn decode_rejects_incorrect_payload_length() {
+        let short = [0u8; BurnPayloadV1::ENCODED_LEN - 1];
+        let long = [0u8; BurnPayloadV1::ENCODED_LEN + 1];
+        assert_eq!(
+            decode_burn_payload_v1(&short),
+            Err(CodecError::InvalidLength)
+        );
+        assert_eq!(
+            decode_burn_payload_v1(&long),
+            Err(CodecError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn encode_decode_round_trip_with_extreme_values() {
+        let payload = BurnPayloadV1 {
+            version: 1,
+            source_domain: SCCP_DOMAIN_TRON,
+            dest_domain: SCCP_DOMAIN_TON,
+            nonce: u64::MAX,
+            sora_asset_id: [0xffu8; 32],
+            amount: u128::MAX,
+            recipient: [0xaau8; 32],
+        };
+        let encoded = payload.encode_scale();
+        let decoded = decode_burn_payload_v1(&encoded).expect("payload must decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn message_id_changes_when_payload_changes() {
+        let mut payload_a = BurnPayloadV1 {
+            version: 1,
+            source_domain: SCCP_DOMAIN_ETH,
+            dest_domain: SCCP_DOMAIN_SORA,
+            nonce: 1,
+            sora_asset_id: [0x11u8; 32],
+            amount: 10,
+            recipient: [0x22u8; 32],
+        };
+        let message_a = burn_message_id(&payload_a.encode_scale());
+
+        payload_a.nonce = 2;
+        let message_b = burn_message_id(&payload_a.encode_scale());
+
+        assert_ne!(message_a, message_b);
+    }
+
+    #[test]
+    fn attest_hash_is_domain_separated_from_burn_prefix() {
+        let payload = BurnPayloadV1 {
+            version: 1,
+            source_domain: SCCP_DOMAIN_ETH,
+            dest_domain: SCCP_DOMAIN_SORA,
+            nonce: 777,
+            sora_asset_id: [0x11u8; 32],
+            amount: 10,
+            recipient: [0x22u8; 32],
+        };
+        let message_id = burn_message_id(&payload.encode_scale());
+        let burn_of_message_id = burn_message_id(&message_id);
+        let attested = attest_hash(&message_id);
+
+        assert_ne!(attested, burn_of_message_id);
+    }
+
+    #[test]
+    fn decode_interprets_fixed_width_fields_as_little_endian() {
+        let mut payload = [0u8; BurnPayloadV1::ENCODED_LEN];
+        payload[0] = 1;
+        payload[1..5].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        payload[5..9].copy_from_slice(&0x5566_7788u32.to_le_bytes());
+        payload[9..17].copy_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        payload[17..49].copy_from_slice(&[0xabu8; 32]);
+        payload[49..65]
+            .copy_from_slice(&0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128.to_le_bytes());
+        payload[65..97].copy_from_slice(&[0xcdu8; 32]);
+
+        let decoded = decode_burn_payload_v1(&payload).expect("payload must decode");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.source_domain, 0x1122_3344);
+        assert_eq!(decoded.dest_domain, 0x5566_7788);
+        assert_eq!(decoded.nonce, 0x0102_0304_0506_0708);
+        assert_eq!(decoded.sora_asset_id, [0xabu8; 32]);
+        assert_eq!(
+            decoded.amount,
+            0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128
+        );
+        assert_eq!(decoded.recipient, [0xcdu8; 32]);
+    }
+
+    #[test]
+    fn burn_message_id_is_domain_separated_from_plain_payload_hash() {
+        let payload = BurnPayloadV1 {
+            version: 1,
+            source_domain: SCCP_DOMAIN_ETH,
+            dest_domain: SCCP_DOMAIN_SORA,
+            nonce: 777,
+            sora_asset_id: [0x11u8; 32],
+            amount: 10,
+            recipient: [0x22u8; 32],
+        };
+        let payload_bytes = payload.encode_scale();
+        let with_prefix = burn_message_id(&payload_bytes);
+
+        let mut k = Keccak::v256();
+        k.update(&payload_bytes);
+        let mut plain = [0u8; 32];
+        k.finalize(&mut plain);
+
+        assert_ne!(with_prefix, plain);
     }
 }
